@@ -16,6 +16,7 @@ import time
 parser = argparse.ArgumentParser()
 parser.add_argument("--input_dir", help="path to folder containing images")
 parser.add_argument("--mode", required=True, choices=["train", "test", "export"])
+parser.add_argument("--validation_input_dir", help="path to folder containing validation images")
 parser.add_argument("--output_dir", required=True, help="where to put output files")
 parser.add_argument("--seed", type=int)
 parser.add_argument("--checkpoint", default=None, help="directory with checkpoint to resume training from or use for testing")
@@ -52,7 +53,8 @@ EPS = 1e-12
 CROP_SIZE = 256
 
 Examples = collections.namedtuple("Examples", "paths, inputs, targets, count, steps_per_epoch")
-Model = collections.namedtuple("Model", "outputs, predict_real, predict_fake, discrim_loss, discrim_grads_and_vars, gen_loss_GAN, gen_loss_L1, gen_grads_and_vars, train")
+Model = collections.namedtuple("Model", "outputs, predict_real, predict_fake, discrim_loss, discrim_grads_and_vars, gen_loss_GAN, gen_loss_L1, gen_loss_total, ssim_loss, psnr, gen_grads_and_vars, train")
+
 
 
 def preprocess(image):
@@ -131,6 +133,37 @@ def lrelu(x, a):
 def batchnorm(inputs):
     return tf.layers.batch_normalization(inputs, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
 
+def ssim_custom(img1, img2, max_val=1.0):
+    C1 = (0.01 * max_val) ** 2
+    C2 = (0.03 * max_val) ** 2
+
+    # Calculate means
+    mean1 = tf.reduce_mean(img1, axis=[1, 2, 3])
+    mean1 = tf.reshape(mean1, [-1, 1, 1, 1])  # Reshape to restore original dimensions
+    mean2 = tf.reduce_mean(img2, axis=[1, 2, 3])
+    mean2 = tf.reshape(mean2, [-1, 1, 1, 1])
+
+    # Calculate variances and covariance
+    variance1 = tf.reduce_mean(tf.square(img1 - mean1), axis=[1, 2, 3])
+    variance1 = tf.reshape(variance1, [-1, 1, 1, 1])
+    variance2 = tf.reduce_mean(tf.square(img2 - mean2), axis=[1, 2, 3])
+    variance2 = tf.reshape(variance2, [-1, 1, 1, 1])
+    covariance = tf.reduce_mean((img1 - mean1) * (img2 - mean2), axis=[1, 2, 3])
+    covariance = tf.reshape(covariance, [-1, 1, 1, 1])
+
+    # SSIM calculation
+    ssim_n = (2 * mean1 * mean2 + C1) * (2 * covariance + C2)
+    ssim_d = (tf.square(mean1) + tf.square(mean2) + C1) * (variance1 + variance2 + C2)
+    ssim = ssim_n / ssim_d
+    return tf.reduce_mean(ssim)
+
+def calculate_psnr(img1, img2, max_val=1.0):
+    # Compute the Mean Squared Error (MSE) between the two images
+    mse = tf.reduce_mean(tf.square(img1 - img2))
+
+    # Calculate PSNR
+    psnr = 20 * tf.log(max_val / tf.sqrt(mse)) / tf.log(10.0)  # Use tf.log instead of tf.math.log
+    return psnr
 
 def check_image(image):
     assertion = tf.assert_equal(tf.shape(image)[-1], 3, message="image must have 3 color channels")
@@ -452,7 +485,18 @@ def create_model(inputs, targets):
         # abs(targets - outputs) => 0
         gen_loss_GAN = tf.reduce_mean(-tf.log(predict_fake + EPS))
         gen_loss_L1 = tf.reduce_mean(tf.abs(targets - outputs))
-        gen_loss = gen_loss_GAN * a.gan_weight + gen_loss_L1 * a.l1_weight
+        gen_loss_total = gen_loss_GAN * a.gan_weight + gen_loss_L1 * a.l1_weight
+
+    with tf.name_scope("SSIM_loss"):
+        # Calculate SSIM between generated outputs and targets
+        ssim_loss = 1 - ssim_custom(targets, outputs, max_val=1.0)
+        ssim_loss_mean = tf.reduce_mean(ssim_loss)
+    
+    # Example usage within your pix2pix code
+    with tf.name_scope("PSNR"):
+    # Assuming 'targets' are real images and 'outputs' are generated images
+        psnr = calculate_psnr(targets, outputs, max_val=1.0)
+        psnr_mean = tf.reduce_mean(psnr)
 
     with tf.name_scope("discriminator_train"):
         discrim_tvars = [var for var in tf.trainable_variables() if var.name.startswith("discriminator")]
@@ -464,11 +508,11 @@ def create_model(inputs, targets):
         with tf.control_dependencies([discrim_train]):
             gen_tvars = [var for var in tf.trainable_variables() if var.name.startswith("generator")]
             gen_optim = tf.train.AdamOptimizer(a.lr, a.beta1)
-            gen_grads_and_vars = gen_optim.compute_gradients(gen_loss, var_list=gen_tvars)
+            gen_grads_and_vars = gen_optim.compute_gradients(gen_loss_total, var_list=gen_tvars)
             gen_train = gen_optim.apply_gradients(gen_grads_and_vars)
 
     ema = tf.train.ExponentialMovingAverage(decay=0.99)
-    update_losses = ema.apply([discrim_loss, gen_loss_GAN, gen_loss_L1])
+    update_losses = ema.apply([discrim_loss, gen_loss_GAN, gen_loss_L1, gen_loss_total])
 
     global_step = tf.train.get_or_create_global_step()
     incr_global_step = tf.assign(global_step, global_step+1)
@@ -480,6 +524,9 @@ def create_model(inputs, targets):
         discrim_grads_and_vars=discrim_grads_and_vars,
         gen_loss_GAN=ema.average(gen_loss_GAN),
         gen_loss_L1=ema.average(gen_loss_L1),
+        gen_loss_total=ema.average(gen_loss_total),
+        ssim_loss=ssim_loss_mean,  # Add SSIM to the model
+        psnr=psnr_mean,
         gen_grads_and_vars=gen_grads_and_vars,
         outputs=outputs,
         train=tf.group(update_losses, incr_global_step, gen_train),
@@ -692,9 +739,16 @@ def main():
     with tf.name_scope("predict_fake_summary"):
         tf.summary.image("predict_fake", tf.image.convert_image_dtype(model.predict_fake, dtype=tf.uint8))
 
+    with tf.name_scope("SSIM_summary"):
+        tf.summary.scalar("SSIM_loss", model.ssim_loss)
+
+    with tf.name_scope("PSNR_summary"):
+        tf.summary.scalar("PSNR", model.psnr)
+
     tf.summary.scalar("discriminator_loss", model.discrim_loss)
     tf.summary.scalar("generator_loss_GAN", model.gen_loss_GAN)
     tf.summary.scalar("generator_loss_L1", model.gen_loss_L1)
+    tf.summary.scalar("generator_loss_total", model.gen_loss_total)
 
     for var in tf.trainable_variables():
         tf.summary.histogram(var.op.name + "/values", var)
@@ -728,14 +782,42 @@ def main():
             # at most, process the test data once
             start = time.time()
             max_steps = min(examples.steps_per_epoch, max_steps)
+            
+            # Initialize summary writer for test phase
+            test_summary_writer = tf.summary.FileWriter(os.path.join(a.output_dir, "test_summary"))
+
             for step in range(max_steps):
-                results = sess.run(display_fetches)
+                fetches = {
+                    "paths": examples.paths,
+                    "inputs": examples.inputs,
+                    "targets": examples.targets,
+                    "outputs": model.outputs,
+                    "ssim_loss": model.ssim_loss,  # Add SSIM to fetches
+                    "psnr": model.psnr,            # Add PSNR to fetches
+                    "gen_loss_total":model.gen_loss_total
+                }
+
+                results = sess.run(fetches)
                 filesets = save_images(results)
+
+                # Log to TensorBoard
+                ssim_summary = tf.Summary(value=[tf.Summary.Value(tag="SSIM_loss", simple_value=results["ssim_loss"])])
+                psnr_summary = tf.Summary(value=[tf.Summary.Value(tag="PSNR", simple_value=results["psnr"])])
+                gen_loss_total_summary = tf.Summary(value=[tf.Summary.Value(tag="gen_loss_total", simple_value=results["gen_loss_total"])])
+                test_summary_writer.add_summary(ssim_summary, step)
+                test_summary_writer.add_summary(psnr_summary, step)
+                test_summary_writer.add_summary(gen_loss_total_summary, step)
+                test_summary_writer.flush()  # Add this line to force TensorBoard to flush data
                 for i, f in enumerate(filesets):
                     print("evaluated image", f["name"])
+                print("SSIM_loss:", results["ssim_loss"])  # Print SSIM loss
+                print("PSNR:", results["psnr"])            # Print PSNR score
+                print("gen_loss_total:", results["gen_loss_total"])  # Print gen_loss_total
                 index_path = append_index(filesets)
             print("wrote index at", index_path)
             print("rate", (time.time() - start) / max_steps)
+            # Close the test summary writer after the loop
+            test_summary_writer.close()
         else:
             # training
             start = time.time()
@@ -759,6 +841,9 @@ def main():
                     fetches["discrim_loss"] = model.discrim_loss
                     fetches["gen_loss_GAN"] = model.gen_loss_GAN
                     fetches["gen_loss_L1"] = model.gen_loss_L1
+                    fetches["gen_loss_total"] = model.gen_loss_total
+                    fetches["ssim_loss"] = model.ssim_loss
+                    fetches["psnr"] = model.psnr
 
                 if should(a.summary_freq):
                     fetches["summary"] = sv.summary_op
@@ -791,6 +876,9 @@ def main():
                     print("discrim_loss", results["discrim_loss"])
                     print("gen_loss_GAN", results["gen_loss_GAN"])
                     print("gen_loss_L1", results["gen_loss_L1"])
+                    print("gen_loss_total", results["gen_loss_total"])
+                    print("SSIM_loss", results["ssim_loss"])  # Print SSIM
+                    print("PSNR", results["psnr"]) # Print PSNR Score
 
                 if should(a.save_freq):
                     print("saving model")
