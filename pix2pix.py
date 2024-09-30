@@ -162,7 +162,7 @@ def calculate_psnr(img1, img2, max_val=1.0):
     mse = tf.reduce_mean(tf.square(img1 - img2))
 
     # Calculate PSNR
-    psnr = 20 * tf.log(max_val / tf.sqrt(mse)) / tf.log(10.0)  # Use tf.log instead of tf.math.log
+    psnr = 20 * tf.log(max_val / tf.sqrt(mse)) / tf.log(10.0)  
     return psnr
 
 def check_image(image):
@@ -492,9 +492,8 @@ def create_model(inputs, targets):
         ssim_loss = 1 - ssim_custom(targets, outputs, max_val=1.0)
         ssim_loss_mean = tf.reduce_mean(ssim_loss)
     
-    # Example usage within your pix2pix code
     with tf.name_scope("PSNR"):
-    # Assuming 'targets' are real images and 'outputs' are generated images
+        #'targets' are real images and 'outputs' are generated images
         psnr = calculate_psnr(targets, outputs, max_val=1.0)
         psnr_mean = tf.reduce_mean(psnr)
 
@@ -525,8 +524,8 @@ def create_model(inputs, targets):
         gen_loss_GAN=ema.average(gen_loss_GAN),
         gen_loss_L1=ema.average(gen_loss_L1),
         gen_loss_total=ema.average(gen_loss_total),
-        ssim_loss=ssim_loss_mean,  # Add SSIM to the model
-        psnr=psnr_mean,
+        ssim_loss=ssim_loss_mean,  # Add SSIM_loss to the model
+        psnr=psnr_mean, # Add PSNR to the model
         gen_grads_and_vars=gen_grads_and_vars,
         outputs=outputs,
         train=tf.group(update_losses, incr_global_step, gen_train),
@@ -792,7 +791,7 @@ def main():
                     "inputs": examples.inputs,
                     "targets": examples.targets,
                     "outputs": model.outputs,
-                    "ssim_loss": model.ssim_loss,  # Add SSIM to fetches
+                    "ssim_loss": model.ssim_loss,  # Add SSIM_loss to fetches
                     "psnr": model.psnr,            # Add PSNR to fetches
                     "gen_loss_total":model.gen_loss_total
                 }
@@ -807,7 +806,7 @@ def main():
                 test_summary_writer.add_summary(ssim_summary, step)
                 test_summary_writer.add_summary(psnr_summary, step)
                 test_summary_writer.add_summary(gen_loss_total_summary, step)
-                test_summary_writer.flush()  # Add this line to force TensorBoard to flush data
+                test_summary_writer.flush()  # Add to force TensorBoard to flush data
                 for i, f in enumerate(filesets):
                     print("evaluated image", f["name"])
                 print("SSIM_loss:", results["ssim_loss"])  # Print SSIM loss
@@ -877,7 +876,7 @@ def main():
                     print("gen_loss_GAN", results["gen_loss_GAN"])
                     print("gen_loss_L1", results["gen_loss_L1"])
                     print("gen_loss_total", results["gen_loss_total"])
-                    print("SSIM_loss", results["ssim_loss"])  # Print SSIM
+                    print("SSIM_loss", results["ssim_loss"])  # Print SSIM_loss
                     print("PSNR", results["psnr"]) # Print PSNR Score
 
                 if should(a.save_freq):
